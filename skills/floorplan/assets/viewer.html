@@ -820,6 +820,8 @@ for (const f of G.files) {
   (f.s || []).forEach((s, i) => { if (!handlers.has(s[0])) addChild('f:' + f.p, `s:${f.p}#${i}`); });
 }
 
+const linkTotals = {};
+for (const l of G.links) linkTotals[l.k] = (linkTotals[l.k] || 0) + 1;
 const chainCache = new Map();
 function chain(item) {
   if (chainCache.has(item)) return chainCache.get(item);
@@ -990,8 +992,12 @@ function buildView(container) {
     hidden = visible.length - keep.length;
     visible.length = 0; visible.push(...keep);
   }
+  // a board with this many cards can't show its connections legibly, and laying them out takes minutes: the cards
+  // are packed in a grid instead, and selecting one lists its connections in the details panel
+  if (visible.length > PACK_AT) return { container, visible, connectors: [], edges, hidden, packed: true };
   return { container, visible, connectors: [...connectors.values()], edges, hidden };
 }
+const PACK_AT = 90;
 
 // ======================= cards =======================
 // Cards carry only what you read at a glance: icon, name, description, one count. Paths, kinds and
@@ -1090,10 +1096,10 @@ function recentTip(id) {
 const measure = document.createElement('canvas').getContext('2d');
 const textW = (s, px = 12, w = 500) => { measure.font = `${w} ${px}px Inter, system-ui, sans-serif`; return measure.measureText(s).width; };
 
-async function layout(view) {
+function layout(view) {
   const deg = new Map();
   const bump = (id) => deg.set(id, (deg.get(id) || 0) + 1);
-  for (const e of view.edges) { bump(e.a); bump(e.b); }
+  if (!view.packed) for (const e of view.edges) { bump(e.a); bump(e.b); }
   const children = [];
   for (const item of view.visible) {
     const [w, hh] = SIZES[info(item).type] || SIZES.file;
@@ -1104,6 +1110,11 @@ async function layout(view) {
     children.push({ id: c.id, width: clamp(textW(info(c.entity).name, 13) + 84, 150, 320), height: Math.max(42, (deg.get(c.id) || 0) * 7 + 14),
       layoutOptions: { 'elk.layered.layering.layerConstraint': c.side === 'in' ? 'FIRST_SEPARATE' : 'LAST_SEPARATE' } });
   }
+  const padding = '[top=40,left=40,bottom=40,right=40]';
+  if (view.packed) return elk.layout({ id: 'g', children, edges: [], layoutOptions: { 'elk.algorithm': 'rectpacking', 'elk.spacing.nodeNode': '32', 'elk.padding': padding } });
+  // network-simplex placement and thorough crossing reduction look best but grow steeply with the number of
+  // connections (a 300-connection board took 40 s): a board with many uses the quicker Brandes-Köpf placement
+  const heavy = view.edges.length > 80;
   return elk.layout({
     id: 'g', children,
     edges: view.edges.map((e) => ({ id: e.id, sources: [e.a], targets: [e.b] })),
@@ -1111,9 +1122,9 @@ async function layout(view) {
       'elk.algorithm': 'layered', 'elk.direction': 'RIGHT', 'elk.edgeRouting': 'ORTHOGONAL',
       'elk.layered.spacing.nodeNodeBetweenLayers': '130', 'elk.spacing.nodeNode': '32',
       'elk.layered.spacing.edgeEdgeBetweenLayers': '8', 'elk.spacing.edgeEdge': '8', 'elk.layered.spacing.edgeNodeBetweenLayers': '24',
-      'elk.layered.nodePlacement.strategy': 'NETWORK_SIMPLEX', 'elk.layered.considerModelOrder.strategy': 'NODES_AND_EDGES',
-      'elk.layered.thoroughness': '12', 'elk.separateConnectedComponents': 'true', 'elk.spacing.componentComponent': '80',
-      'elk.padding': '[top=40,left=40,bottom=40,right=40]',
+      'elk.layered.nodePlacement.strategy': heavy ? 'BRANDES_KOEPF' : 'NETWORK_SIMPLEX', 'elk.layered.considerModelOrder.strategy': 'NODES_AND_EDGES',
+      'elk.layered.thoroughness': heavy ? '3' : '12', 'elk.separateConnectedComponents': 'true', 'elk.spacing.componentComponent': '80',
+      'elk.padding': padding,
     },
   });
 }
@@ -1134,17 +1145,38 @@ function roundedPath(pts, r = 10) {
   return d + `L${z.x},${z.y}`;
 }
 
-let renderToken = 0;
+// boards already laid out, by part and what's shown, so going back to one is instant (the last 40)
+const boards = new Map();
+const boardKey = (container) => `${container}|${KINDS.filter((k) => state.kinds[k]).join(',')}|${technical() ? 1 : 0}`;
+function prepare(container) {
+  if (container === 'q:answer') { const view = buildView(container); return layout(view).then((res) => ({ view, res })); }
+  const key = boardKey(container);
+  let p = boards.get(key);
+  if (p) boards.delete(key);
+  else {
+    const view = buildView(container);
+    p = layout(view).then((res) => ({ view, res }));
+    p.catch(() => boards.delete(key));
+    if (boards.size >= 40) boards.delete(boards.keys().next().value);
+  }
+  boards.set(key, p);
+  return p;
+}
+
+let renderToken = 0, loadingTimer = null;
 async function render(opts = {}) {
   const token = ++renderToken;
-  const view = buildView(state.container);
-  const loading = setTimeout(() => $('#loading').classList.add('on'), 160);
-  let res;
-  try { res = await layout(view); }
-  catch (e) { console.error(e); clearTimeout(loading); $('#loading').classList.remove('on'); $('#empty').hidden = false; $('#empty').textContent = 'Layout failed: ' + e.message; return; }
-  clearTimeout(loading);
-  $('#loading').classList.remove('on');
+  clearTimeout(loadingTimer);
+  loadingTimer = setTimeout(() => $('#loading').classList.add('on'), 160);
+  let view, res;
+  try { ({ view, res } = await prepare(state.container)); }
+  catch (e) {
+    if (token !== renderToken) return;
+    console.error(e); clearTimeout(loadingTimer); $('#loading').classList.remove('on'); $('#empty').hidden = false; $('#empty').textContent = 'Layout failed: ' + e.message; return;
+  }
   if (token !== renderToken) return;
+  clearTimeout(loadingTimer);
+  $('#loading').classList.remove('on');
   state.view = view; state.layout = res;
   queueMicrotask(() => emit('render', { container: state.container, view }));
   draw(view, res);
@@ -1463,6 +1495,7 @@ async function go(container, { select: sel = null, push = true, zoomFrom = null,
     const k = Math.min(r.width / c.width, r.height / c.height) * 0.6;
     setT({ k, x: r.width / 2 - (c.x + c.width / 2) * k, y: r.height / 2 - (c.y + c.height / 2) * k }, true);
     vp.style.opacity = '0';
+    prepare(container).catch(() => {}); // lay the board out during the zoom
     await new Promise((ok) => setTimeout(ok, 260));
   }
   vp.classList.remove('anim'); vp.style.opacity = '0';
@@ -1534,7 +1567,7 @@ function renderContext() {
   const i = info(state.container);
   const kind = state.container === 'root' ? 'Overview' : i.type === 'node' ? i.kind.charAt(0).toUpperCase() + i.kind.slice(1) : i.type === 'dir' ? 'Folder' : i.type === 'file' ? 'File' : i.type;
   const badge = state.container === 'root' ? '' : `<span class="ico" style="--c:${colorOf(i)}">${icon(iconKey(i))}</span>`;
-  $('#context').innerHTML = `<div class="k">${badge}${h(kind)}</div><h1>${h(i.name)}</h1>${i.desc ? `<p class="cd" id="ctx-desc">${h(i.desc)}</p>` : ''}${state.view?.hidden ? `<p class="cx" style="color:var(--text-3);font-size:12.5px;margin-top:8px">${state.view.hidden} more exports aren't imported by name anywhere; they're listed in the details panel.</p>` : ''}${i.desc ? '<button type="button" class="ctx-more" aria-controls="ctx-desc" hidden></button>' : ''}`;
+  $('#context').innerHTML = `<div class="k">${badge}${h(kind)}</div><h1>${h(i.name)}</h1>${i.desc ? `<p class="cd" id="ctx-desc">${h(i.desc)}</p>` : ''}${state.view?.hidden ? `<p class="cx" style="color:var(--text-3);font-size:12.5px;margin-top:8px">${state.view.hidden} more exports aren't imported by name anywhere; they're listed in the details panel.</p>` : ''}${state.view?.packed ? `<p class="cx" style="color:var(--text-3);font-size:12.5px;margin-top:8px">${state.view.visible.length} parts are too many to draw the connections between; select one to see its connections in the details panel.</p>` : ''}${i.desc ? '<button type="button" class="ctx-more" aria-controls="ctx-desc" hidden></button>' : ''}`;
   foldContext();
 }
 /** On a phone the description folds to one line; the More / Less toggle shows only when there's more to read, and the choice is remembered on this device. */
@@ -1565,7 +1598,7 @@ function renderCrumbs() {
   $('#btn-up').hidden = state.container === 'root';
 }
 function renderLegend(view) {
-  const total = {}; for (const l of G.links) total[l.k] = (total[l.k] || 0) + 1;
+  const total = linkTotals;
   const here = {}; for (const e of view.edges) here[e.k] = (here[e.k] || 0) + 1;
   const L = $('#legend'); L.innerHTML = '<div class="lh">Show connections</div>';
   const techRow = () => { const lab = document.createElement('label'); lab.className = 'tech' + (technical() ? '' : ' off'); lab.innerHTML = `<input type="checkbox" ${technical() ? 'checked' : ''}><span>Show technical detail</span><span class="tog" style="margin-left:auto"></span>`; lab.querySelector('input').onchange = (ev) => setTechnical(ev.target.checked); return lab; };
